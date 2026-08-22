@@ -570,14 +570,21 @@ func (r *Relay) close(reason error) error {
 	if r.connectionContextCancel == nil {
 		return fmt.Errorf("relay already closed")
 	}
+	// read the connection before cancelling: the writer goroutine started by
+	// ConnectWithTLS sets r.Connection = nil when connectionContext is done, and
+	// closeMutex does not serialise against that goroutine. reading the field
+	// after the cancellation below is therefore a data race, and losing it
+	// between the nil check and the Close() call is a nil-pointer dereference.
+	conn := r.Connection
+
 	r.connectionContextCancel(reason)
 	r.connectionContextCancel = nil
 
-	if r.Connection == nil {
+	if conn == nil {
 		return fmt.Errorf("relay not connected")
 	}
 
-	err := r.Connection.Close()
+	err := conn.Close()
 	if err != nil {
 		return err
 	}
