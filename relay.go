@@ -172,10 +172,13 @@ func (r *Relay) ConnectWithTLS(ctx context.Context, tlsConfig *tls.Config) error
 			select {
 			case <-r.connectionContext.Done():
 				ticker.Stop()
+				r.closeMutex.Lock()
 				r.Connection = nil
+				connErr := r.ConnectionError
+				r.closeMutex.Unlock()
 
 				for _, sub := range r.Subscriptions.Range {
-					sub.unsub(fmt.Errorf("relay connection closed: %w / %w", context.Cause(r.connectionContext), r.ConnectionError))
+					sub.unsub(fmt.Errorf("relay connection closed: %w / %w", context.Cause(r.connectionContext), connErr))
 				}
 				return
 
@@ -219,7 +222,9 @@ func (r *Relay) ConnectWithTLS(ctx context.Context, tlsConfig *tls.Config) error
 			buf.Reset()
 
 			if err := conn.ReadMessage(r.connectionContext, buf); err != nil {
+				r.closeMutex.Lock()
 				r.ConnectionError = err
+				r.closeMutex.Unlock()
 				r.close(err)
 				break
 			}
@@ -407,7 +412,10 @@ func (r *Relay) publish(ctx context.Context, id string, env Envelope) error {
 func (r *Relay) Subscribe(ctx context.Context, filters Filters, opts ...SubscriptionOption) (*Subscription, error) {
 	sub := r.PrepareSubscription(ctx, filters, opts...)
 
-	if r.Connection == nil {
+	r.closeMutex.Lock()
+	connected := r.Connection != nil
+	r.closeMutex.Unlock()
+	if !connected {
 		return nil, fmt.Errorf("not connected to %s", r.URL)
 	}
 
