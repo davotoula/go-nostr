@@ -4,6 +4,11 @@ package nostr
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -147,4 +152,89 @@ func TestCloseAgainstASilentPeerIsBounded(t *testing.T) {
 		t.Errorf("close() took %v against a silent peer; the writer goroutine waits on the "+
 			"same mutex, so this is how long a publish can stall", closeTook)
 	}
+}
+
+// The dial-address hook: the caller is told which relay is being dialled and
+// what it actually resolved to, and can refuse.
+//
+// Both directions, because a hook that refuses everything would satisfy the
+// first half and make the library useless.
+func TestDialAddressCheckSeesTheRelayAndTheResolvedAddress(t *testing.T) {
+	ws := newWebsocketServer(discardingHandler)
+	defer ws.Close()
+
+	t.Run("refusing aborts the dial", func(t *testing.T) {
+		var seenURL, seenResolved string
+		r := NewRelay(context.Background(), ws.URL, WithDialAddressCheck(
+			func(network, relayURL, resolved string) error {
+				seenURL, seenResolved = relayURL, resolved
+				return fmt.Errorf("refused by the caller")
+			}))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := r.Connect(ctx); err == nil {
+			t.Fatal("the dial succeeded despite the check refusing it")
+		}
+
+		// The URL, so a caller can key a policy on WHICH relay this is. Asserted
+		// against the relay's own normalised URL rather than merely "not empty":
+		// the consumer's exemption matches on this exact string, and a future
+		// change passing something else — the resolved address, a bare host —
+		// would keep a non-empty check green while silently breaking it.
+		if seenURL != r.URL {
+			t.Errorf("relayURL = %q, want the relay's own URL %q", seenURL, r.URL)
+		}
+		// And the address on the socket, which is the whole reason for the hook.
+		host, _, err := net.SplitHostPort(seenResolved)
+		if err != nil {
+			t.Fatalf("resolved = %q, which is not host:port: %v", seenResolved, err)
+		}
+		if net.ParseIP(host) == nil {
+			t.Errorf("resolved = %q, which is not an IP", host)
+		}
+	})
+
+	// The option must not change anything else about the request. It takes a
+	// different code path from the header-free default — a fresh transport
+	// instead of the shared DialOptions — and the first version of it dropped
+	// the library's User-Agent on that path, silently changing how every relay
+	// sees a client that turned the check on.
+	t.Run("the default User-Agent survives the option", func(t *testing.T) {
+		seen := make(chan string, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case seen <- r.Header.Get("User-Agent"):
+			default:
+			}
+			w.WriteHeader(http.StatusTeapot)
+		}))
+		defer srv.Close()
+
+		r := NewRelay(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"),
+			WithDialAddressCheck(func(string, string, string) error { return nil }))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = r.Connect(ctx) // 418, so the handshake fails; the header still arrived
+
+		select {
+		case got := <-seen:
+			if want := defaultConnectionOptions.HTTPHeader.Get("User-Agent"); got != want {
+				t.Errorf("User-Agent = %q, want %q — the dial check must not change what "+
+					"the relay sees", got, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("the server was never reached")
+		}
+	})
+
+	t.Run("allowing connects as before", func(t *testing.T) {
+		r := NewRelay(context.Background(), ws.URL, WithDialAddressCheck(
+			func(string, string, string) error { return nil }))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := r.Connect(ctx); err != nil {
+			t.Fatalf("a check that allows everything broke the dial: %v", err)
+		}
+		r.Close()
+	})
 }

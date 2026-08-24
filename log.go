@@ -1,8 +1,8 @@
 package nostr
 
 import (
-	"log"
 	"io"
+	"log"
 )
 
 var (

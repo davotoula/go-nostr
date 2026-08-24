@@ -25,6 +25,10 @@ type Relay struct {
 	URL           string
 	requestHeader http.Header // e.g. for origin header
 
+	// dialAddressCheck vets the address a connection actually resolved to.
+	// See DialAddressCheck.
+	dialAddressCheck DialAddressCheck
+
 	Connection    *Connection
 	Subscriptions *xsync.MapOf[int64, *Subscription]
 
@@ -86,6 +90,41 @@ func RelayConnect(ctx context.Context, url string, opts ...RelayOption) (*Relay,
 type RelayOption interface {
 	ApplyRelayOption(*Relay)
 }
+
+// DialAddressCheck is consulted immediately before a relay connection is
+// established, with the relay's own URL and the address actually RESOLVED for
+// it. Returning an error aborts the dial.
+//
+// It exists because a caller cannot otherwise know what it connected to. A
+// caller that resolves a hostname itself and vets the result is checking a
+// resolution this library then repeats, and the two can differ — a DNS record
+// that changes between them, or a name that answers differently each time,
+// walks through such a check. resolved is the address on the socket.
+//
+// relayURL is this relay's URL, and it is there so a caller can apply a policy
+// that depends on WHICH relay this is. A check given only the resolved address
+// cannot tell a relay its operator configured — which may legitimately be on a
+// private network — from one a stranger named, where a private address is an
+// attack. The URL rather than the host, because two relays can differ only by
+// port or path and still be two relays: this pool keys them that way.
+//
+// network and resolved are what net.Dialer's Control receives: "tcp4" or
+// "tcp6", and an already-resolved "ip:port".
+//
+// NOT ENFORCED ON js/wasm. There is no dialer to hook there, so the js build
+// accepts the option and ignores it, as it ignores the rest of the connection
+// options. A caller relying on this for security must not run on that target.
+type DialAddressCheck func(network, relayURL, resolved string) error
+
+// WithDialAddressCheck supplies a DialAddressCheck for this relay's
+// connections.
+type WithDialAddressCheck DialAddressCheck
+
+func (c WithDialAddressCheck) ApplyRelayOption(r *Relay) {
+	r.dialAddressCheck = DialAddressCheck(c)
+}
+
+var _ RelayOption = (WithDialAddressCheck)(nil)
 
 var (
 	_ RelayOption = (WithNoticeHandler)(nil)
@@ -156,7 +195,7 @@ func (r *Relay) ConnectWithTLS(ctx context.Context, tlsConfig *tls.Config) error
 		defer cancel()
 	}
 
-	conn, err := NewConnection(ctx, r.URL, r.requestHeader, tlsConfig)
+	conn, err := NewConnection(ctx, r.URL, r.requestHeader, tlsConfig, r.dialAddressCheck)
 	if err != nil {
 		return fmt.Errorf("error opening websocket to '%s': %w", r.URL, err)
 	}
